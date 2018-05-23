@@ -1,196 +1,268 @@
-#! /usr/bin/env python
+#encoding:utf-8
+#run3.py 只看含有两个动词的句子
 
-import tensorflow as tf
 import numpy as np
-import os
+import tensorflow as tf
 import time
-import datetime
-import data_helpers
-from text_cnn import TextCNN
-from tensorflow.contrib import learn
+import os
+import sys, getopt
+import importlib
+from elapsed import elapsed
 
-# Parameters
-# ==================================================
 
-# Data loading params
-tf.flags.DEFINE_float("dev_sample_percentage", .1, "Percentage of the training data to use for validation")
-tf.flags.DEFINE_string("positive_data_file", "./data/rt-polaritydata/rt-polarity.pos", "Data source for the positive data.")
-tf.flags.DEFINE_string("negative_data_file", "./data/rt-polaritydata/rt-polarity.neg", "Data source for the negative data.")
+'''
+def getMem():
+    with open('/proc/meminfo') as f:
+        total = int(f.readline().split()[1])
+        free = int(f.readline().split()[1])
+        buffers = int(f.readline().split()[1])
+        cache = int(f.readline().split()[1])
+        while(buffers<1000000):
+            print('wait',buffers)
+            time.sleep(60)
+            buffers = int(f.readline().split()[1])
+        return buffers
+'''
 
-# Model Hyperparameters
-tf.flags.DEFINE_integer("embedding_dim", 128, "Dimensionality of character embedding (default: 128)")
-tf.flags.DEFINE_string("filter_sizes", "3,4,5", "Comma-separated filter sizes (default: '3,4,5')")
-tf.flags.DEFINE_integer("num_filters", 128, "Number of filters per filter size (default: 128)")
-tf.flags.DEFINE_float("dropout_keep_prob", 0.5, "Dropout keep probability (default: 0.5)")
-tf.flags.DEFINE_float("l2_reg_lambda", 0.0, "L2 regularization lambda (default: 0.0)")
 
-# Training parameters
-tf.flags.DEFINE_integer("batch_size", 64, "Batch Size (default: 64)")
-tf.flags.DEFINE_integer("num_epochs", 200, "Number of training epochs (default: 200)")
-tf.flags.DEFINE_integer("evaluate_every", 100, "Evaluate model on dev set after this many steps (default: 100)")
-tf.flags.DEFINE_integer("checkpoint_every", 100, "Save model after this many steps (default: 100)")
-tf.flags.DEFINE_integer("num_checkpoints", 5, "Number of checkpoints to store (default: 5)")
-# Misc Parameters
-tf.flags.DEFINE_boolean("allow_soft_placement", True, "Allow device soft device placement")
-tf.flags.DEFINE_boolean("log_device_placement", False, "Log placement of ops on devices")
+   
 
-FLAGS = tf.flags.FLAGS
-# FLAGS._parse_flags()
-# print("\nParameters:")
-# for attr, value in sorted(FLAGS.__flags.items()):
-#     print("{}={}".format(attr.upper(), value))
-# print("")
+os.environ["CUDA_VISIBLE_DEVICES"]=""#环境变量：使用第一块gpu
+logs_path = 'tense/log/run'
+saving_path='tense/run/run.ckpt'
+load_path='tense/run/'
 
-def preprocess():
-    # Data Preparation
-    # ==================================================
+#神经网络的输入是一句只有一个动词的句子（以及其语法树），把动词变为原型，语法树的tag变为了VB。
+#并预测它的动词时态。如果它不为0，输入变为这句话以及他前面的patchlength句话。
+#语法树结构：（VB love）会被变为三个标签：（VB的（100维）one-hot标签，love的词向量标签，反括号对应的全0标签。
+#每个反括号对应一个单独的标签，而正括号没有。
 
-    # Load data
-    print("Loading data...")
-    x_text, y = data_helpers.load_data_and_labels(FLAGS.positive_data_file, FLAGS.negative_data_file)
+patchlength=3                   #输入的前文句子的数量
+embedding_size=100              #词向量维度数量
+maxlength=700                   #输入序列最大长度
+initial_training_rate=0.0001     #学习率
+training_iters = 10000000       #迭代次数
+batch_size=50                   #batch数量
+display_step = 20               #多少步输出一次结果
+saving_step=1000                  #多少步保存一次
+num_verbs=1                     #一次看两个动词
+allinclude=True                #只看刚好含有num_verbs个动词的句子
+passnum=0
+vocab_single=7                  #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!以后都是7维了
 
-    # Build vocabulary
-    max_document_length = max([len(x.split(" ")) for x in x_text])
-    vocab_processor = learn.preprocessing.VocabularyProcessor(max_document_length)
-    x = np.array(list(vocab_processor.fit_transform(x_text)))
+time_verbose_flag=False         #测量输入和运行的时间比
 
-    # Randomly shuffle data
-    np.random.seed(10)
-    shuffle_indices = np.random.permutation(np.arange(len(y)))
-    x_shuffled = x[shuffle_indices]
-    y_shuffled = y[shuffle_indices]
+reader = importlib.import_module('trainreader')
+rnnmodel = importlib.import_module('tensernnmodel')
 
-    # Split train/test set
-    # TODO: This is very crude, should use cross-validation
-    dev_sample_index = -1 * int(FLAGS.dev_sample_percentage * float(len(y)))
-    x_train, x_dev = x_shuffled[:dev_sample_index], x_shuffled[dev_sample_index:]
-    y_train, y_dev = y_shuffled[:dev_sample_index], y_shuffled[dev_sample_index:]
 
-    del x, y, x_shuffled, y_shuffled
+config=tf.ConfigProto()
+config.gpu_options.per_process_gpu_memory_fraction=0.45#占用45%显存
+loadold=True
+shorten=False
+shorten_front=False
+testflag=False
+multiflag=False
+multinum=1
 
-    print("Vocabulary Size: {:d}".format(len(vocab_processor.vocabulary_)))
-    print("Train/Dev split: {:d}/{:d}".format(len(y_train), len(y_dev)))
-    return x_train, y_train, vocab_processor, x_dev, y_dev
+dpflag=False#被动语态训练
 
-def train(x_train, y_train, vocab_processor, x_dev, y_dev):
-    # Training
-    # ==================================================
 
-    with tf.Graph().as_default():
-        session_conf = tf.ConfigProto(
-          allow_soft_placement=FLAGS.allow_soft_placement,
-          log_device_placement=FLAGS.log_device_placement)
-        sess = tf.Session(config=session_conf)
-        with sess.as_default():
-            cnn = TextCNN(
-                sequence_length=x_train.shape[1],
-                num_classes=y_train.shape[1],
-                vocab_size=len(vocab_processor.vocabulary_),
-                embedding_size=FLAGS.embedding_dim,
-                filter_sizes=list(map(int, FLAGS.filter_sizes.split(","))),
-                num_filters=FLAGS.num_filters,
-                l2_reg_lambda=FLAGS.l2_reg_lambda)
+try:
+    opts, args = getopt.getopt(sys.argv[1:],"hg:l:L:p:x:n:r:m:ais:oStP:T:KD")
+except getopt.GetoptError:
+    print('使用不正确.详见python run.py -h')
+    sys.exit()
+for opt, arg in opts:
+    if opt == '-h':
+        print('''usage:
+run.py  -g 使用gpu号(0,1) 默认:不使用
+        -l limit 是否限制gpu显存为50%(不填)(默认:限制)
+        -L learning_rate
+        -p patchlength前文数量(数字,默认:3)
+        -x maxlength句子长度(数字,默认:700)
+        -n num_verbs单词数量(数字,默认:2)
+        -r 读取模型(模型名,文件名去掉.py 默认:reader)
+        -m rnn模型(模型名,文件名去掉.py 默认:rnnmodel)
+        -a 存储的allow_growth(不填)(默认:不允许)
+        -s 保存用的标识,默认:run.log路径为log/run,保存路径为ckpt2/run/run.ckpt
+        -i allinclude 默认为not[读入时只读入含有num_verbs个动词的句子, 设置后读入所有含有不少于num_verbs的句子]
+        -o 是否从上次的模型加载 默认:是
+        -S shorten=True shorten_front=True
+        -P 读入时跳过几个
+        -t test
+        ''')
+        sys.exit()
+    elif opt=="-g":
+        os.environ["CUDA_VISIBLE_DEVICES"]=arg
+    elif opt=="-l":
+        config.gpu_options.per_process_gpu_memory_fraction=float(arg)#占用显存
+    elif opt=="-L":
+        initial_training_rate=float(arg)
+    elif opt=="-p":
+        patchlength=int(arg)
+    elif opt=="-x":
+        maxlength=int(arg)
+    elif opt=="-n":
+        num_verbs=int(arg)
+    elif opt=="-r":
+        reader = importlib.import_module(arg)
+    elif opt=="-m":
+        rnnmodel = importlib.import_module(arg)
+    elif opt=="-a":
+        tf_config.gpu_options.allow_growth = True
+    elif opt=="-s":
+        logs_path = 'tense/log/'+arg
+        saving_path='tense/'+arg+'/'+arg+'.ckpt'
+        saving_path3='tense/max/'+arg+'/'+arg+'.ckpt'
+        load_path='tense/'+arg
+    elif opt=="-i":
+        allinclude=False
+    elif opt=="-o":
+        loadold=False
+    elif opt=="-S":
+        shorten=True
+        shorten_front=True
+    elif opt=='-t':
+        loadold=True
+        allinclude=True
+        batch_size=1
+        saving_step=100000000000
+        display_step=10000000000
 
-            # Define Training procedure
-            global_step = tf.Variable(0, name="global_step", trainable=False)
-            optimizer = tf.train.AdamOptimizer(1e-3)
-            grads_and_vars = optimizer.compute_gradients(cnn.loss)
-            train_op = optimizer.apply_gradients(grads_and_vars, global_step=global_step)
+#        config.device_count={'gpu':0}#使用cpu
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        testflag=True
+    elif opt=='-T':
+        testflag=True
+        loadold=True
+        allinclude=True
+        batch_size=1
+        saving_step=100000000000
+        display_step=10000000000
 
-            # Keep track of gradient values and sparsity (optional)
-            grad_summaries = []
-            for g, v in grads_and_vars:
-                if g is not None:
-                    grad_hist_summary = tf.summary.histogram("{}/grad/hist".format(v.name), g)
-                    sparsity_summary = tf.summary.scalar("{}/grad/sparsity".format(v.name), tf.nn.zero_fraction(g))
-                    grad_summaries.append(grad_hist_summary)
-                    grad_summaries.append(sparsity_summary)
-            grad_summaries_merged = tf.summary.merge(grad_summaries)
+#        config.device_count={'gpu':0}#使用cpu
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        multiflag=True
+        multinum=int(arg)
+        training_iters=2
+    elif opt=='-P':
+        passnum=int(arg)
+    elif opt=='-D':
+        dpflag=True
+        vocab_single=7
 
-            # Output directory for models and summaries
-            timestamp = str(int(time.time()))
-            out_dir = os.path.abspath(os.path.join(os.path.curdir, "runs", timestamp))
-            print("Writing to {}\n".format(out_dir))
 
-            # Summaries for loss and accuracy
-            loss_summary = tf.summary.scalar("loss", cnn.loss)
-            acc_summary = tf.summary.scalar("accuracy", cnn.accuracy)
 
-            # Train Summaries
-            train_summary_op = tf.summary.merge([loss_summary, acc_summary, grad_summaries_merged])
-            train_summary_dir = os.path.join(out_dir, "summaries", "train")
-            train_summary_writer = tf.summary.FileWriter(train_summary_dir, sess.graph)
 
-            # Dev summaries
-            dev_summary_op = tf.summary.merge([loss_summary, acc_summary])
-            dev_summary_dir = os.path.join(out_dir, "summaries", "dev")
-            dev_summary_writer = tf.summary.FileWriter(dev_summary_dir, sess.graph)
 
-            # Checkpoint directory. Tensorflow assumes this directory already exists so we need to create it
-            checkpoint_dir = os.path.abspath(os.path.join(out_dir, "checkpoints"))
-            checkpoint_prefix = os.path.join(checkpoint_dir, "model")
-            if not os.path.exists(checkpoint_dir):
-                os.makedirs(checkpoint_dir)
-            saver = tf.train.Saver(tf.global_variables(), max_to_keep=FLAGS.num_checkpoints)
+start_time = time.time()
+#input
+data=reader.reader(patchlength=patchlength,\
+            maxlength=maxlength,\
+            embedding_size=embedding_size,\
+            num_verbs=num_verbs,\
+            allinclude=allinclude,\
+            shorten=shorten,\
+            shorten_front=shorten_front,\
+            testflag=testflag,\
+            passnum=passnum,\
+            dpflag=dpflag)
 
-            # Write vocabulary
-            vocab_processor.save(os.path.join(out_dir, "vocab"))
 
-            # Initialize all variables
-            sess.run(tf.global_variables_initializer())
+model=rnnmodel.rnnmodel(vocab_single=vocab_single,\
+            maxlength=maxlength,\
+            embedding_size=embedding_size,\
+            initial_training_rate=initial_training_rate,\
+            batch_size=batch_size,\
+            num_verbs=num_verbs)
 
-            def train_step(x_batch, y_batch):
-                """
-                A single training step
-                """
-                feed_dict = {
-                  cnn.input_x: x_batch,
-                  cnn.input_y: y_batch,
-                  cnn.dropout_keep_prob: FLAGS.dropout_keep_prob
-                }
-                _, step, summaries, loss, accuracy = sess.run(
-                    [train_op, global_step, train_summary_op, cnn.loss, cnn.accuracy],
-                    feed_dict)
-                time_str = datetime.datetime.now().isoformat()
-                print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
-                train_summary_writer.add_summary(summaries, step)
+#通过在命令行运行tensorboard --logdir=$logs_path 然后按提示在浏览器打开http://....:6006即可.
+#使用远程服务器的话如果想在自己的电脑上看,需要找到某个公开的端口,如8001, 运行tensorboard --logdir=log/rnn3 然后浏览器打开http://xxx.xxx.xxx.xxx:8001即可(xxx为服务器域名)
+writer = tf.summary.FileWriter(logs_path)
 
-            def dev_step(x_batch, y_batch, writer=None):
-                """
-                Evaluates model on a dev set
-                """
-                feed_dict = {
-                  cnn.input_x: x_batch,
-                  cnn.input_y: y_batch,
-                  cnn.dropout_keep_prob: 1.0
-                }
-                step, summaries, loss, accuracy = sess.run(
-                    [global_step, dev_summary_op, cnn.loss, cnn.accuracy],
-                    feed_dict)
-                time_str = datetime.datetime.now().isoformat()
-                print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
-                if writer:
-                    writer.add_summary(summaries, step)
+# 数据存储器.一定要写在整个网络的末尾.
+saver=tf.train.Saver()
+tf.summary.scalar('train_loss', model.cost)
+tf.summary.scalar('accuracy', model.accuracy)
+merged = tf.summary.merge_all()
 
-            # Generate batches
-            batches = data_helpers.batch_iter(
-                list(zip(x_train, y_train)), FLAGS.batch_size, FLAGS.num_epochs)
-            # Training loop. For each batch...
-            for batch in batches:
-                x_batch, y_batch = zip(*batch)
-                train_step(x_batch, y_batch)
-                current_step = tf.train.global_step(sess, global_step)
-                if current_step % FLAGS.evaluate_every == 0:
-                    print("\nEvaluation:")
-                    dev_step(x_dev, y_dev, writer=dev_summary_writer)
-                    print("")
-                if current_step % FLAGS.checkpoint_every == 0:
-                    path = saver.save(sess, checkpoint_prefix, global_step=current_step)
-                    print("Saved model checkpoint to {}\n".format(path))
+# Launch the graph
+max_acc_total=0
+print('start session')
 
-def main(argv=None):
-    x_train, y_train, vocab_processor, x_dev, y_dev = preprocess()
-    train(x_train, y_train, vocab_processor, x_dev, y_dev)
+#multi-time test
+while True:
+    print('iter')
+    multitime=0
+    while True:
+        print('nut,',multitime)
 
-if __name__ == '__main__':
-    tf.app.run()
+        with tf.Session(config=config) as session:
+            session.run(tf.global_variables_initializer())#初始化变量
+            if loadold:
+#reload the test model multiple times
+                if multiflag==True:
+                    ckpt = tf.train.get_checkpoint_state('tense/p'+str(multitime)+'n1')
+                    print('p'+str(multitime)+'n1')
+                else:
+                    ckpt = tf.train.get_checkpoint_state(load_path)
+
+                saver.restore(session, ckpt.model_checkpoint_path)
+            step = 1
+            acc_total = 0
+            loss_total = 0
+
+            writer.add_graph(session.graph)
+            while step < training_iters:
+#读入一个batch的数据
+#重用的话只要实现自己的reader.py就行.
+#输出:count:指针,指向读到文件的哪个位置
+#inputs:batch_size个输入句子,形状为[batch_size, maxlength, embedding_size]
+#pads:batch内每句话的长度,形状为[batch_size]
+#answers:输入的答案,形状为[batch_size,vocab_size]
+                #print('i')
+                #print('b',batch_size)
+                if multitime==0:
+                    #print('listtags')
+
+                    inputs,pads,answers,singleverb=data.list_tags(batch_size)
+                    #print('sv',singleverb)
+#运行一次
+                _,pred, acc, loss, summary= session.run([model.optimizer, model.pred, model.accuracy, model.cost, merged], \
+                                                        feed_dict={model.x: inputs, model.y: answers, model.p:pads})
+#累加计算平均正确率
+                if testflag==True:
+                    #print(pred)
+                    #print(tf.argmax(pred[0]).eval())
+                    #print(type(tf.argmax(pred[0]).eval()))
+                    print('pred:', data.printtag(tf.argmax(pred[0]).eval()))
+                    step+=1
+                else:
+                    loss_total += loss
+                    acc_total += acc
+                    step += 1
+#帮global_step(用来调节学习率指数下降的)加一
+                    model.global_step += 1
+                    #print(model.global_step.eval())
+#输出
+                    if step % display_step == 0:
+                        writer.add_summary(summary, step)
+                        #print('free memory= '+str(int(getMem()/1000000))+"GB, Iter= " + str(step+1) + ", Average Loss= " + \
+                        print( "Iter= " + str(step+1) + ", Average Loss= " + \
+                              "{:.6f}".format(loss_total/display_step) + ", Average Accuracy= " + \
+                              "{:.2f}%".format(100*acc_total/display_step)," Elapsed time: ", elapsed(time.time() - start_time))
+                        if testflag==False and acc_total>max_acc_total:
+                            max_acc_total=acc_total
+                            print('saved to: ', saver.save(session,saving_path3,global_step=step))
+#                        start_time=time.time()
+                        acc_total = 0
+                        loss_total = 0
+#保存
+                    if step % saving_step ==0:
+                        print('saved to: ', saver.save(session,saving_path,global_step=step))
+            if testflag==True:
+                multitime+=1
+                if multitime>=singleverb:
+                    print('mts',multitime,singleverb)
+                    break
