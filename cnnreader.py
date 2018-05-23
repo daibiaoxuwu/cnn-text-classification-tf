@@ -100,12 +100,12 @@ class reader(object):
         for i in self.verbtags:
             if (self.ldict[verb]+'('+i) not in self.cldict:
                 if verb in self.verbset:
-                    print('verb in set and ldict but not in verbtags',verb)
+            #        print('verb in set and ldict but not in verbtags',verb)
                     return True
                 else:
                     return False
         if verb not in self.verbset:
-            print('verb not in set but in ldict and verbtags',verb)
+           # print('verb not in set but in ldict and verbtags',verb)
             return False
         return True
         
@@ -114,7 +114,7 @@ class reader(object):
                 patchlength=3,\
                 maxlength=700,\
                 embedding_size=100,\
-                num_verbs=2,\
+                num_verbs=1,\
                 allinclude=False,\
                 shorten=False,\
                 shorten_front=False,\
@@ -137,13 +137,13 @@ class reader(object):
         self.dpflag=dpflag
         print('pas',passnum)
         self.verbtags=['VB','VBZ','VBP','VBD','VBN','VBG'] #所有动词的tag
-        self.model=word2vec.load('tense/combine100.bin')   #加载词向量模型
+        self.model=word2vec.load('../Challenge2018/papersmith/editor/grammar/tense/combine100.bin')   #加载词向量模型
         print('loaded model')
         self.oldqueue=Queue()
         self.testflag=testflag
 
         if testflag==False:
-            self.resp=open(r'tense/resp2').readlines()
+            self.resp=open(r'../Challenge2018/papersmith/editor/grammar/tense/resp2').readlines()
             self.readlength=len(self.resp)
             print('readlength',self.readlength)
             self.pointer=random.randint(0,self.readlength-1)
@@ -165,13 +165,13 @@ class reader(object):
 #加载文字
 
 #加载原型词典(把动词变为它的原型)
-        with open('tense/ldict2', 'rb') as f:
+        with open('../Challenge2018/papersmith/editor/grammar/tense/ldict2', 'rb') as f:
             self.ldict = pickle.load(f)
-        with open('tense/tagdict', 'rb') as f:
+        with open('../Challenge2018/papersmith/editor/grammar/tense/tagdict', 'rb') as f:
             self.tagdict = pickle.load(f)
-        with open('tense/cldict', 'rb') as f:
+        with open('../Challenge2018/papersmith/editor/grammar/tense/cldict', 'rb') as f:
             self.cldict = pickle.load(f)
-        with open('tense/verbset', 'rb') as f:
+        with open('../Challenge2018/papersmith/editor/grammar/tense/verbset', 'rb') as f:
             self.verbset = pickle.load(f)
         
         
@@ -198,9 +198,10 @@ class reader(object):
             return [0]*self.embedding_size
 
     def list_tags(self,batch_size,testbatch=False):
+        print(self.pointer,self.readlength)
         if(testbatch==True):
             oldpointer=self.pointer
-            self.pointer=self.readlength*5/6
+            self.pointer=int(self.readlength*5/6)
         while True:#防止读到末尾
             inputs=[]
             pads=[]
